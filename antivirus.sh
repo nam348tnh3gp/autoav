@@ -1,8 +1,8 @@
 #!/bin/bash
 # ======================================================================
-#   Auto Antivirus & Monitoring System v2.6.3 – Refined Guardian
-#   Light patch: iptables deduplication, firewalld support,
-#               tighter quarantine permissions (750).
+#   Auto Antivirus & Monitoring System v2.6.5 – Precision Edition
+#   Patch: Reduced boot-time full scan max file size from 500MB to 100MB
+#          for faster, more focused initial protection.
 # ======================================================================
 set -euo pipefail
 
@@ -66,13 +66,13 @@ install_deps() {
         log_info "Updating existing virtual environment..."
         source "$INSTALL_DIR/venv/bin/activate"
         pip install --upgrade pip
-        pip install --upgrade pyclamd yara-python flask flask-sqlalchemy watchdog requests pyyaml gunicorn
+        pip install --upgrade pyclamd yara-python flask flask-sqlalchemy watchdog requests pyyaml gunicorn psutil
         deactivate
     else
         python3 -m venv "$INSTALL_DIR/venv"
         source "$INSTALL_DIR/venv/bin/activate"
         pip install --upgrade pip
-        pip install pyclamd yara-python flask flask-sqlalchemy watchdog requests pyyaml gunicorn
+        pip install pyclamd yara-python flask flask-sqlalchemy watchdog requests pyyaml gunicorn psutil
         deactivate
     fi
     log_ok "Dependencies installed."
@@ -143,7 +143,6 @@ find_clamd_socket() {
     return 1
 }
 
-# --- Firewall setup with deduplication and firewalld support ---
 setup_firewall() {
     log_info "Configuring firewall for dashboard port $DASHBOARD_PORT..."
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
@@ -170,7 +169,6 @@ setup_firewall() {
         else
             log_info "iptables DROP rule already present."
         fi
-        # Save rules for persistence
         if command -v iptables-save &>/dev/null; then
             if [ -d /etc/iptables ]; then
                 iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
@@ -221,8 +219,9 @@ EOF
 
     CLAMD_SOCK=$(wait_for_clamd_socket)
     
+    # *** PATCH: full_scan_max_file_size_mb changed from 500 to 100 ***
     cat > "$CONFIG_FILE" << EOF
-# AutoAV v2.6.3 Configuration
+# AutoAV v2.6.5 Configuration
 watch_directories:
   - /home
   - /tmp
@@ -234,6 +233,11 @@ watch_directories:
 exclude_paths:
   - /proc
   - /sys
+  - /dev
+  - /run
+  - /snap
+  - /var/lib/docker
+  - /var/lib/lxc
 max_file_size_mb: 100
 clamd_socket: "$CLAMD_SOCK"
 yara_rule_file: "$INSTALL_DIR/rules/malware.yar"
@@ -247,6 +251,21 @@ scan_debounce_seconds: 5
 disk_usage_warning_percent: 10
 watchdog_health_check_seconds: 60
 quarantine_permission_check_seconds: 300
+# Boot-time full system scan (Precision Edition)
+initial_full_scan: true
+full_scan_paths:
+  - /
+full_scan_max_file_size_mb: 100
+full_scan_nice: 19
+full_scan_ionice: 3
+full_scan_exclude:
+  - /proc
+  - /sys
+  - /dev
+  - /run
+  - /snap
+  - /var/lib/docker
+  - /var/lib/lxc
 EOF
 
     cat > "$INSTALL_DIR/rules/malware.yar" << 'YAR'
@@ -269,8 +288,9 @@ YAR
 write_daemon() {
     cat > "$INSTALL_DIR/av-daemon.py" << 'PYEOF'
 #!/usr/bin/env python3
-import os, sys, time, signal, logging, json, threading, sqlite3, shutil
+import os, sys, time, signal, logging, json, threading, sqlite3, shutil, subprocess
 from datetime import datetime
+from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import yaml, pyclamd, yara
 import requests
@@ -291,6 +311,13 @@ EXCLUDE_PATHS = config.get('exclude_paths', [])
 HEALTH_CHECK_INTERVAL = config.get('watchdog_health_check_seconds', 60)
 PERM_CHECK_INTERVAL = config.get('quarantine_permission_check_seconds', 300)
 SAFE_BASE_DIRS = [os.path.realpath(d) for d in WATCH_DIRS]
+# Boot-time scan settings
+INITIAL_FULL_SCAN = config.get('initial_full_scan', True)
+FULL_SCAN_PATHS = config.get('full_scan_paths', ['/'])
+FULL_SCAN_MAX_SIZE = config.get('full_scan_max_file_size_mb', 100) * 1024*1024
+FULL_SCAN_NICE = config.get('full_scan_nice', 19)
+FULL_SCAN_IONICE = config.get('full_scan_ionice', 3)
+FULL_SCAN_EXCLUDE = config.get('full_scan_exclude', ['/proc', '/sys', '/dev', '/run'])
 
 for d in WATCH_DIRS:
     if d != os.path.realpath(d):
@@ -343,8 +370,10 @@ def should_scan(path):
         _last_scan_time[path] = now
     return True
 
-def is_excluded(path):
-    for ex in EXCLUDE_PATHS:
+def is_excluded(path, exclude_list=None):
+    if exclude_list is None:
+        exclude_list = EXCLUDE_PATHS
+    for ex in exclude_list:
         if path.startswith(ex):
             return True
     return False
@@ -382,7 +411,6 @@ def check_quarantine_permissions():
                 try:
                     session.post(WEBHOOK_URL, json={'text': f'[ERROR] {msg}'}, timeout=REQUEST_TIMEOUT)
                 except: pass
-            # Auto-fix if root (tighter permission: 750)
             if os.geteuid() == 0:
                 try:
                     os.chmod(QUARANTINE_DIR, 0o750)
@@ -454,6 +482,86 @@ def scan_file(path, scan_type='auto'):
             try:
                 session.post(WEBHOOK_URL, json={'text': f"[CRITICAL] {threat} in {path}"}, timeout=REQUEST_TIMEOUT)
             except: pass
+
+# ========== BOOT-TIME FULL SYSTEM SCAN ==========
+def perform_initial_full_scan():
+    logger.info("=== Starting boot-time full system scan (Precision Mode: max 100MB/file) ===")
+    start_time = time.time()
+    files_scanned = 0
+    threats_found = 0
+    try:
+        os.nice(FULL_SCAN_NICE)
+    except Exception as e:
+        logger.warning(f"Could not set nice value: {e}")
+    try:
+        subprocess.run(['ionice', '-c', str(FULL_SCAN_IONICE), '-p', str(os.getpid())])
+    except Exception as e:
+        logger.warning(f"Could not set ionice: {e}")
+    
+    for scan_root in FULL_SCAN_PATHS:
+        if not os.path.exists(scan_root):
+            logger.warning(f"Full scan path does not exist: {scan_root}")
+            continue
+        logger.info(f"Full scanning: {scan_root}")
+        for dirpath, dirnames, filenames in os.walk(scan_root):
+            dirnames[:] = [d for d in dirnames if not is_excluded(os.path.join(dirpath, d), FULL_SCAN_EXCLUDE)]
+            for filename in filenames:
+                filepath = os.path.join(dirpath, filename)
+                if is_excluded(filepath, FULL_SCAN_EXCLUDE):
+                    continue
+                try:
+                    if os.path.getsize(filepath) > FULL_SCAN_MAX_SIZE:
+                        continue
+                except OSError:
+                    continue
+                try:
+                    result = {'clamav': '', 'yara': []}
+                    try:
+                        scan = cd.scan_file(filepath)
+                        if scan and filepath in scan:
+                            result['clamav'] = str(scan[filepath])
+                    except Exception as e:
+                        logger.debug(f"ClamAV full scan error on {filepath}: {e}")
+                    if rules:
+                        try:
+                            matches = rules.match(filepath)
+                            if matches:
+                                result['yara'] = [m.rule for m in matches]
+                        except Exception as e:
+                            logger.debug(f"YARA full scan error on {filepath}: {e}")
+                    if result['clamav'] or result['yara']:
+                        threat = result['clamav'] or ', '.join(result['yara'])
+                        logger.warning(f"FULL SCAN THREAT: {filepath} -> {threat}")
+                        conn = sqlite3.connect(DB_PATH)
+                        c = conn.cursor()
+                        now = datetime.now().isoformat()
+                        c.execute("INSERT INTO malware (ts,path,name,scan_type,action,status) VALUES (?,?,?,?,?,?)",
+                                  (now, filepath, threat, 'full_scan_boot', "Quarantined", "Infected"))
+                        c.execute("INSERT INTO events (ts,type,path,desc,severity) VALUES (?,?,?,?,?)",
+                                  (now, 'full_scan_alert', filepath, threat, 'high'))
+                        conn.commit(); conn.close()
+                        if is_safe_to_move(filepath) and os.access(QUARANTINE_DIR, os.W_OK):
+                            try:
+                                dest = os.path.join(QUARANTINE_DIR, os.path.basename(filepath) + ".malz")
+                                need_bytes = os.path.getsize(filepath)
+                                stat = os.statvfs(QUARANTINE_DIR)
+                                free_bytes = stat.f_bavail * stat.f_frsize
+                                if need_bytes <= free_bytes:
+                                    shutil.move(filepath, dest)
+                            except Exception as e:
+                                logger.error(f"Full scan quarantine failed: {filepath}: {e}")
+                        threats_found += 1
+                        if WEBHOOK_URL:
+                            try:
+                                session.post(WEBHOOK_URL, json={'text': f'[FULL SCAN MALWARE] {threat} in {filepath}'}, timeout=REQUEST_TIMEOUT)
+                            except: pass
+                    files_scanned += 1
+                    if files_scanned % 1000 == 0:
+                        logger.info(f"Full scan progress: {files_scanned} files scanned, {threats_found} threats found...")
+                except Exception as e:
+                    logger.debug(f"Error scanning {filepath}: {e}")
+    elapsed = time.time() - start_time
+    logger.info(f"=== Full system scan complete: {files_scanned} files scanned, {threats_found} threats found in {elapsed:.2f} seconds ===")
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -553,6 +661,11 @@ def start_webhook():
 def main():
     start_monitor()
     start_webhook()
+    if INITIAL_FULL_SCAN:
+        logger.info("Boot-time full scan is enabled. Starting in background...")
+        threading.Thread(target=perform_initial_full_scan, daemon=True).start()
+    else:
+        logger.info("Boot-time full scan is disabled.")
     threading.Thread(target=watchdog_health_check, daemon=True).start()
     threading.Thread(target=check_quarantine_permissions, daemon=True).start()
     def disk_checker():
@@ -560,7 +673,7 @@ def main():
             time.sleep(900)
             check_disk_space()
     threading.Thread(target=disk_checker, daemon=True).start()
-    logger.info("AutoAV daemon v2.6.3 started.")
+    logger.info("AutoAV daemon v2.6.5 started.")
     try:
         while True:
             time.sleep(1)
@@ -649,12 +762,13 @@ PYEOF
     cat > "$INSTALL_DIR/templates/dashboard.html" << 'HTMLEOF'
 <!DOCTYPE html>
 <html>
-<head><title>AutoAV Refined</title>
+<head><title>AutoAV Precision</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body class="bg-light">
 <div class="container-fluid">
-  <h2 class="mt-3">🛡️ AutoAV Refined Guardian v2.6.3</h2>
+  <h2 class="mt-3">🛡️ AutoAV Precision v2.6.5</h2>
+  <p class="text-muted">Focused Boot Scan (≤100MB) + Real-Time Guard</p>
   <div class="row">
     <div class="col-md-4">
       <div class="card">
@@ -671,10 +785,11 @@ PYEOF
   <hr>
   <h4>Recent Malware</h4>
   <table class="table table-striped">
-    <tr><th>Time</th><th>File</th><th>Threat</th><th>Status</th><th>Action</th></tr>
+    <tr><th>Time</th><th>File</th><th>Threat</th><th>Type</th><th>Status</th><th>Action</th></tr>
     {% for m in malware %}
     <tr>
       <td>{{ m.ts[:19] }}</td><td>{{ m.path }}</td><td class="text-danger">{{ m.name }}</td>
+      <td><span class="badge bg-info">{{ m.scan_type }}</span></td>
       <td><span class="badge bg-danger">{{ m.status }}</span></td>
       <td>
         {% if m.action != 'Quarantined' %}
@@ -705,7 +820,7 @@ HTMLEOF
 create_services() {
     cat > "$SERVICE_DIR/autoav-daemon.service" << EOF
 [Unit]
-Description=AutoAV Daemon (Scanner + Webhook API)
+Description=AutoAV Daemon (Scanner + Webhook API + Boot Scan)
 After=network.target clamav-daemon.service
 
 [Service]
@@ -746,9 +861,10 @@ EOF
 
 main() {
     clear
-    echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN} Auto Antivirus v2.6.3 – Refined Guardian ${NC}"
-    echo -e "${GREEN}===========================================${NC}"
+    echo -e "${GREEN}=============================================${NC}"
+    echo -e "${GREEN} Auto Antivirus v2.6.5 – Precision Edition   ${NC}"
+    echo -e "${GREEN} Focused Boot Scan (100MB) + Real-Time Guard ${NC}"
+    echo -e "${GREEN}=============================================${NC}"
     read -p "Enter Webhook URL (or leave blank): " WEBHOOK_URL
     check_root
     detect_distro
@@ -769,6 +885,7 @@ main() {
     echo -e "API Token stored in: /etc/autoav_api_token"
     echo -e "Reload config: sudo systemctl reload autoav-daemon"
     echo -e "${YELLOW}Firewall active – dashboard accessible only from localhost.${NC}"
+    echo -e "Boot-Time Full Scan: ${GREEN}Enabled${NC} (max file size: 100MB)"
     echo -e "Monitor dirs: /home, /tmp, /var/www, /etc, /usr/bin, /dev/shm, /run/shm"
     echo
     echo "One‑click test command:"
