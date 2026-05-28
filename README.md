@@ -51,7 +51,7 @@ cd autoav
 2. Run the installer
 
 ```bash
-sudo bash autoav.sh
+sudo bash antivirus.sh
 ```
 
 The script will:
