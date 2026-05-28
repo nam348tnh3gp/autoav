@@ -295,7 +295,7 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 ---
 
-🙏 Acknowledgements
+👀 Acknowledgements
 
 · ClamAV – the open‑source antivirus engine.
 · YARA – the pattern matching tool for malware researchers.
