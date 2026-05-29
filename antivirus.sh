@@ -3,6 +3,9 @@
 #   Auto Antivirus & Monitoring System v2.6.5 – Precision Edition
 #   Patch: Reduced boot-time full scan max file size from 500MB to 100MB
 #          for faster, more focused initial protection.
+#   Fixes: - detect_clamav_service no longer pollutes stdout
+#          - freshclam false positive warning removed
+#          - Expanded socket detection for CentOS/RHEL
 # ======================================================================
 set -euo pipefail
 
@@ -78,6 +81,9 @@ install_deps() {
     log_ok "Dependencies installed."
 }
 
+# -------------------------------------------
+# FIXED: Warnings go to stderr, never stdout
+# -------------------------------------------
 detect_clamav_service() {
     if systemctl list-unit-files | grep -q 'clamav-daemon.service'; then
         echo "clamav-daemon"
@@ -86,7 +92,8 @@ detect_clamav_service() {
     elif systemctl list-unit-files | grep -q 'clamd.service'; then
         echo "clamd"
     else
-        log_warn "Could not detect ClamAV service name. Please start it manually."
+        # Print warning to stderr so it doesn't pollute the function's stdout
+        >&2 echo -e "${YELLOW}[W]${NC} Could not detect ClamAV service name. Please start it manually."
         echo ""
     fi
 }
@@ -94,18 +101,23 @@ detect_clamav_service() {
 setup_clamav() {
     log_info "Configuring ClamAV..."
     systemctl stop clamav-freshclam 2>/dev/null || true
+
+    # Run freshclam with proper success tracking
+    local freshclam_ok=false
     for i in {1..3}; do
         if freshclam; then
             log_ok "Virus database updated."
+            freshclam_ok=true
             break
         else
             log_warn "freshclam attempt $i failed, retrying in 10s..."
             sleep 10
         fi
     done
-    if ! pgrep freshclam &>/dev/null; then
+    if ! $freshclam_ok; then
         log_warn "freshclam may have failed completely. Check network."
     fi
+
     systemctl enable --now clamav-freshclam 2>/dev/null || true
     
     local clamav_service=$(detect_clamav_service)
@@ -131,15 +143,33 @@ wait_for_clamd_socket() {
     log_err "ClamAV socket did not appear after 20 seconds. Check ClamAV service."
 }
 
+# -------------------------------------------
+# FIXED: Expanded socket detection for CentOS/RHEL
+# -------------------------------------------
 find_clamd_socket() {
+    # Try main config file
     local conf="/etc/clamav/clamd.conf"
     if [ -f "$conf" ]; then
         local path=$(grep -E '^\s*LocalSocket\s+' "$conf" | grep -v '^\s*#' | awk '{print $2}')
         [ -n "$path" ] && [ -S "$path" ] && { echo "$path"; return; }
     fi
-    for path in "/var/run/clamav/clamd.ctl" "/run/clamav/clamd.ctl" "/var/lib/clamav/clamd.socket"; do
+
+    # CentOS/RHEL often uses /etc/clamd.d/scan.conf
+    local scan_conf="/etc/clamd.d/scan.conf"
+    if [ -f "$scan_conf" ]; then
+        local path=$(grep -E '^\s*LocalSocket\s+' "$scan_conf" | grep -v '^\s*#' | awk '{print $2}')
+        [ -n "$path" ] && [ -S "$path" ] && { echo "$path"; return; }
+    fi
+
+    # Common fallback locations
+    for path in "/var/run/clamav/clamd.ctl" \
+                "/run/clamav/clamd.ctl" \
+                "/var/lib/clamav/clamd.socket" \
+                "/var/run/clamd.scan/clamd.sock" \
+                "/run/clamd.scan/clamd.sock"; do
         [ -S "$path" ] && { echo "$path"; return; }
     done
+
     return 1
 }
 
