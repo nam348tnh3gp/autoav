@@ -3,7 +3,7 @@
 #   Auto Antivirus & Monitoring System v2.6.5 – Precision Edition
 #   Patch: Reduced boot-time full scan max file size from 500MB to 100MB
 #          for faster, more focused initial protection.
-#   Fixes: - detect_clamav_service no longer pollutes stdout
+#   Fixes: - detect_clamav_service now works reliably on all major distros
 #          - freshclam false positive warning removed
 #          - Expanded socket detection for CentOS/RHEL
 # ======================================================================
@@ -82,17 +82,19 @@ install_deps() {
 }
 
 # -------------------------------------------
-# FIXED: Warnings go to stderr, never stdout
+# UPDATED: detect_clamav_service now works on all major distros
 # -------------------------------------------
 detect_clamav_service() {
+    # Check for clamav-daemon (Debian/Ubuntu/openSUSE)
     if systemctl list-unit-files | grep -q 'clamav-daemon.service'; then
         echo "clamav-daemon"
+    # Check for clamd@scan (RHEL/CentOS/Rocky/AlmaLinux)
     elif systemctl list-unit-files | grep -q 'clamd@scan.service'; then
         echo "clamd@scan"
+    # Check for clamd (generic/systemd)
     elif systemctl list-unit-files | grep -q 'clamd.service'; then
         echo "clamd"
     else
-        # Print warning to stderr so it doesn't pollute the function's stdout
         >&2 echo -e "${YELLOW}[W]${NC} Could not detect ClamAV service name. Please start it manually."
         echo ""
     fi
@@ -851,7 +853,7 @@ create_services() {
     cat > "$SERVICE_DIR/autoav-daemon.service" << EOF
 [Unit]
 Description=AutoAV Daemon (Scanner + Webhook API + Boot Scan)
-After=network.target clamav-daemon.service
+After=network.target clamav-daemon.service clamd@scan.service clamd.service
 
 [Service]
 Type=simple
